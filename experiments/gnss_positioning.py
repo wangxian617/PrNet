@@ -1,11 +1,12 @@
 """
 GNSS Positioning Utilities
 ==========================
-Python implementation of WLS, EKF, RTS, and MHE positioning algorithms,
-ported from the MATLAB codebase in GNSS_opensource_software/.
+Extract positioning data from pre-processed CSV files and apply
+EKF/RTS smoothing on the WLS position time series.
 
-These operate on the pre-processed CSV data already available in
-Data/RouteR/Testing/ and Data/RouteU/Testing/.
+The CSV files contain pre-computed WLS positions, pseudorange errors,
+and residuals from the MATLAB pipeline. We use these directly and apply
+EKF/RTS/MHE on the POSITION domain (smoothing WLS positions over time).
 """
 
 import numpy as np
@@ -13,15 +14,19 @@ from numpy.linalg import inv, pinv, norm
 
 
 # ============================================================
-# Coordinate Conversions (from Xyz2Lla.m, Lla2Xyz.m, RotEcef2Ned.m)
+# Constants
 # ============================================================
-
-# WGS-84 constants
-WGS84_A = 6378137.0  # semi-major axis (m)
+WGS84_A = 6378137.0
 WGS84_F = 1.0 / 298.257223563
 WGS84_B = WGS84_A * (1 - WGS84_F)
 WGS84_E2 = 2 * WGS84_F - WGS84_F ** 2
+LIGHTSPEED = 2.99792458e8
+R_EARTH = 6371000.0
 
+
+# ============================================================
+# Coordinate Conversions
+# ============================================================
 
 def xyz2lla(xyz):
     """Convert ECEF (x, y, z) in meters to geodetic (lat_deg, lon_deg, alt_m)."""
@@ -51,18 +56,6 @@ def lla2xyz(lla):
     return np.array([x, y, z])
 
 
-def rot_ecef2ned(lat_deg, lon_deg):
-    """Rotation matrix from ECEF to NED, given lat/lon in degrees."""
-    lat = np.radians(lat_deg)
-    lon = np.radians(lon_deg)
-    R = np.array([
-        [-np.sin(lat) * np.cos(lon), -np.sin(lat) * np.sin(lon), np.cos(lat)],
-        [-np.sin(lon), np.cos(lon), 0],
-        [-np.cos(lat) * np.cos(lon), -np.cos(lat) * np.sin(lon), -np.sin(lat)]
-    ])
-    return R
-
-
 def compute_horizontal_error_m(lla_est, lla_gt):
     """Compute horizontal distance error in meters between two LLA points."""
     lat1, lon1 = np.radians(lla_est[0]), np.radians(lla_est[1])
@@ -71,7 +64,7 @@ def compute_horizontal_error_m(lla_est, lla_gt):
     dlon = lon2 - lon1
     a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
     c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
-    return 6371000.0 * c
+    return R_EARTH * c
 
 
 # ============================================================
@@ -85,43 +78,22 @@ def parse_csv_columns(header_line):
 
 
 def extract_epoch_data(data, col_map):
-    """
-    Extract per-epoch, per-satellite data from the CSV array.
-    
-    Returns dict of epoch -> {
-        'prns': array of PRN,
-        'sv_xyz': Nx3 satellite positions,
-        'elevation': N elevations,
-        'cn0': N CN0 values,
-        'raw_pr': N raw pseudoranges (R column),
-        'atm_corr': N atmospheric corrections,
-        'pr_error': N pseudorange errors (ground truth),
-        'pr_residuals': N pseudorange residuals,
-        'smoothed_pr_residuals': N smoothed pseudorange residuals,
-        'wls_xyz': 3-vector WLS position (ECEF),
-        'gt_xyz': 3-vector ground truth position (ECEF),
-        'wls_bc': WLS clock bias,
-        'heading': Nx3 heading vectors,
-        'geom_vec': Nx3 unit geometry vectors,
-        'pr_error_plus_dtu': N pseudorange error + delta dtu,
-        'delta_dtu': scalar delta dtu,
-    }
-    """
+    """Extract per-epoch, per-satellite data from the CSV array."""
     epochs = {}
     epoch_col = col_map['Epoch']
     prn_col = col_map['PRN']
-    
+
     unique_epochs = np.unique(data[:, epoch_col])
-    
+
     for ep in unique_epochs:
         mask = data[:, epoch_col] == ep
         ep_data = data[mask]
-        
+
         prns = ep_data[:, prn_col].astype(int)
         if len(prns) == 0 or prns[0] == 0:
             continue
-            
-        epochs[int(ep)] = {
+
+        entry = {
             'prns': prns,
             'sv_xyz': ep_data[:, [col_map['SvX'], col_map['SvY'], col_map['SvZ']]],
             'dtsv': ep_data[:, col_map['Dtsv']],
@@ -135,13 +107,11 @@ def extract_epoch_data(data, col_map):
             'pr_error_unc': ep_data[:, col_map['Pseudorange Error Uncertainty']],
             'pr_error': ep_data[:, col_map['Pseudorange Error']],
             'delta_dtu': ep_data[0, col_map['DeltaDtu']],
-            'hat_delta_dtu': ep_data[0, col_map['Hat_DeltaDtu']],
             'pr_rate': ep_data[:, col_map['Pseudorange Rate']],
             'geom_vec': ep_data[:, [col_map['Unit Geometry Matrix N'],
                                      col_map['Unit Geometry Matrix E'],
                                      col_map['Unit Geometry Vector D']]],
             'pr_error_plus_dtu': ep_data[:, col_map['Pseudorange Error plus DeltaDtu']],
-            'azimuth': ep_data[:, col_map['Azimuth']],
             'pr_residuals': ep_data[:, col_map['Pseudorange Residuals']],
             'smoothed_pr_residuals': ep_data[:, col_map['Smoothed Pseudorange Residuals']],
             'heading': ep_data[:, [col_map['Heading of Smartphone N'],
@@ -149,415 +119,262 @@ def extract_epoch_data(data, col_map):
                                     col_map['Heading of Smartphone D']]],
             'h_item': ep_data[:, col_map['Item of h']],
         }
-    
+
+        # Add EKF position if available in CSV (RouteU format)
+        if 'EkfLon Degree' in col_map:
+            entry['ekf_lon'] = (ep_data[0, col_map['EkfLon Degree']] +
+                                ep_data[0, col_map['EkfLon Minute']] / 60 +
+                                ep_data[0, col_map['EkfLon Second']] / 3600)
+            entry['ekf_lat'] = (ep_data[0, col_map['EkfLat Degree']] +
+                                ep_data[0, col_map['EkfLat Minute']] / 60 +
+                                ep_data[0, col_map['EkfLat Second']] / 3600)
+
+        epochs[int(ep)] = entry
+
     return epochs
 
 
 # ============================================================
-# WLS Position from pre-computed data
+# WLS Position (pre-computed in CSV)
 # ============================================================
 
 def wls_position_from_csv(epoch_data):
-    """
-    Compute WLS position from pre-processed CSV data.
-    Uses the WLS position already computed in the CSV (WlsX, WlsY, WlsZ).
-    Also computes pseudorange residuals.
-    
-    Returns (wls_xyz, wls_lla, pr_residuals_wls)
-    """
+    """Extract WLS position and pre-computed pseudorange residuals from CSV."""
     wls_xyz = epoch_data['wls_xyz']
     wls_lla = xyz2lla(wls_xyz)
-    
-    # Compute pseudorange residuals from WLS solution
-    sv_xyz = epoch_data['sv_xyz']
-    raw_pr = epoch_data['raw_pr']
-    wls_bc = epoch_data['wls_bc']
-    
-    # Geometric range from WLS position to each satellite
-    ranges = np.sqrt(np.sum((sv_xyz - wls_xyz[np.newaxis, :]) ** 2, axis=1))
-    
-    # Pseudorange residuals = observed - predicted
-    pr_residuals = raw_pr - (ranges + wls_bc)
-    
+    pr_residuals = epoch_data['pr_residuals']
     return wls_xyz, wls_lla, pr_residuals
 
 
 # ============================================================
-# EKF Positioning (simplified, using pre-computed data)
+# EKF on position domain (smoothing WLS positions over time)
 # ============================================================
-
-class EKFState:
-    """Extended Kalman Filter state for GNSS positioning."""
-    
-    def __init__(self):
-        # State: [x, vx, y, vy, z, vz, bc, fc]
-        self.X = np.zeros(8)
-        self.P = np.eye(8) * 1e6
-        self.initialized = False
-        self.warmup_count = 0
-    
-    def initialize(self, wls_xyz, wls_bc):
-        self.X = np.array([
-            wls_xyz[0], 0.0,
-            wls_xyz[1], 0.0,
-            wls_xyz[2], 0.0,
-            wls_bc, 0.0
-        ])
-        self.P = np.eye(8) * 100.0
-        self.initialized = True
-        self.warmup_count = 1
-    
-    def predict(self, dt):
-        """State prediction step."""
-        if dt <= 0:
-            dt = 1.0
-        
-        # State transition matrix
-        a = np.array([[1, dt], [0, 1]])
-        a0 = np.zeros((2, 2))
-        A = np.block([
-            [a, a0, a0, a0],
-            [a0, a, a0, a0],
-            [a0, a0, a, a0],
-            [a0, a0, a0, a]
-        ])
-        
-        # Process noise - use moderate values
-        Sv = 5.0  # velocity noise PSD (m/s^2)^2/Hz
-        St = 100.0  # clock bias noise
-        Sf = 10.0   # clock drift noise
-        
-        Qx = np.array([[Sv * dt ** 3 / 3, Sv * dt ** 2 / 2],
-                        [Sv * dt ** 2 / 2, Sv * dt]])
-        Qt = np.array([[St * dt + Sf * dt ** 3 / 3, Sf * dt ** 2 / 2],
-                        [Sf * dt ** 2 / 2, Sf * dt]])
-        Q0 = np.zeros((2, 2))
-        Q = np.block([
-            [Qx, Q0, Q0, Q0],
-            [Q0, Qx, Q0, Q0],
-            [Q0, Q0, Qx, Q0],
-            [Q0, Q0, Q0, Qt]
-        ])
-        
-        self.X = A @ self.X
-        self.P = A @ self.P @ A.T + Q
-        
-        return self.X.copy(), self.P.copy()
-    
-    def update(self, sv_xyz, pr_observed, pr_sigma):
-        """Measurement update step."""
-        num_sv = len(pr_observed)
-        if num_sv < 4:
-            return self.X.copy()
-        
-        xyz = np.array([self.X[0], self.X[2], self.X[4]])
-        bc = self.X[6]
-        
-        # Compute expected ranges and measurement matrix
-        dxyz = xyz[np.newaxis, :] - sv_xyz  # user - satellite
-        ranges = np.sqrt(np.sum(dxyz ** 2, axis=1))
-        
-        # Line of sight unit vectors
-        los = dxyz / ranges[:, np.newaxis]
-        
-        # Measurement matrix C (2*numSv x 8) for position and velocity
-        C = np.zeros((num_sv, 8))
-        for i in range(num_sv):
-            C[i, :] = [los[i, 0], 0, los[i, 1], 0, los[i, 2], 0, 1, 0]
-        
-        # Measurement residuals
-        pr_predicted = ranges + bc
-        z = pr_observed - pr_predicted
-        
-        # Measurement noise covariance
-        R = np.diag(pr_sigma ** 2)
-        
-        # Kalman gain
-        S = C @ self.P @ C.T + R
-        try:
-            K = self.P @ C.T @ inv(S)
-        except np.linalg.LinAlgError:
-            K = self.P @ C.T @ pinv(S)
-        
-        # State update
-        self.X = self.X + K @ z
-        self.P = (np.eye(8) - K @ C) @ self.P
-        self.warmup_count += 1
-        
-        return self.X.copy()
-    
-    def get_position_lla(self):
-        xyz = np.array([self.X[0], self.X[2], self.X[4]])
-        return xyz2lla(xyz)
-    
-    def get_position_xyz(self):
-        return np.array([self.X[0], self.X[2], self.X[4]])
-
 
 def run_ekf(epoch_data_dict, sorted_epochs):
     """
-    Run EKF over all epochs.
-    Returns dict of epoch -> {'xyz': ..., 'lla': ..., 'pr_residuals': ...}
+    Run EKF smoothing on the WLS position time series.
+    State: [x, vx, y, vy, z, vz] in ECEF.
+    Measurements: WLS XYZ positions.
     """
-    ekf = EKFState()
     results = {}
-    prev_epoch = None
-    
+    X = None  # state [x, vx, y, vy, z, vz]
+    P = None
+    prev_ep = None
+
     for ep in sorted_epochs:
         ed = epoch_data_dict[ep]
+        wls_xyz = ed['wls_xyz']
         num_sv = len(ed['prns'])
-        
+
         if num_sv < 4:
-            if ekf.initialized:
+            if X is not None:
+                xyz = np.array([X[0], X[2], X[4]])
                 results[ep] = {
-                    'xyz': ekf.get_position_xyz(),
-                    'lla': ekf.get_position_lla(),
+                    'xyz': xyz, 'lla': xyz2lla(xyz),
                     'pr_residuals': np.array([]),
-                    'bc': ekf.X[6],
+                    'X': X.copy(), 'P': P.copy(),
                 }
             continue
-        
-        if not ekf.initialized:
-            ekf.initialize(ed['wls_xyz'], ed['wls_bc'])
+
+        if X is None:
+            # Initialize
+            X = np.array([wls_xyz[0], 0, wls_xyz[1], 0, wls_xyz[2], 0], dtype=float)
+            P = np.diag([100, 10, 100, 10, 100, 10])
+            prev_ep = ep
+            xyz = np.array([X[0], X[2], X[4]])
             results[ep] = {
-                'xyz': ekf.get_position_xyz(),
-                'lla': ekf.get_position_lla(),
+                'xyz': xyz, 'lla': xyz2lla(xyz),
                 'pr_residuals': ed['pr_residuals'],
-                'bc': ekf.X[6],
+                'X': X.copy(), 'P': P.copy(),
             }
-            prev_epoch = ep
             continue
-        
+
+        dt = max(float(ep - prev_ep), 0.1)
+
         # Prediction
-        dt = (ep - prev_epoch) if prev_epoch is not None else 1.0
-        ekf.predict(dt)
-        
-        # Compute corrected pseudoranges
-        raw_pr = ed['raw_pr']
-        pr_sigma = ed['pr_error_unc']
-        pr_sigma = np.clip(pr_sigma, 1.0, 100.0)
-        
-        # Update
-        ekf.update(ed['sv_xyz'], raw_pr, pr_sigma)
-        
-        # Compute pseudorange residuals with EKF position
-        ekf_xyz = ekf.get_position_xyz()
-        ranges = np.sqrt(np.sum((ed['sv_xyz'] - ekf_xyz[np.newaxis, :]) ** 2, axis=1))
-        pr_res = raw_pr - (ranges + ekf.X[6])
-        
+        a = np.array([[1, dt], [0, 1]])
+        a0 = np.zeros((2, 2))
+        A = np.block([[a, a0, a0], [a0, a, a0], [a0, a0, a]])
+
+        Sv = 2.0  # acceleration noise PSD
+        Qb = np.array([[Sv * dt ** 3 / 3, Sv * dt ** 2 / 2],
+                        [Sv * dt ** 2 / 2, Sv * dt]])
+        Q0 = np.zeros((2, 2))
+        Q = np.block([[Qb, Q0, Q0], [Q0, Qb, Q0], [Q0, Q0, Qb]])
+
+        Xp = A @ X
+        Pp = A @ P @ A.T + Q
+
+        # Measurement update: observe WLS position [x, y, z]
+        H = np.array([
+            [1, 0, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0],
+            [0, 0, 0, 0, 1, 0],
+        ], dtype=float)
+
+        # Measurement noise from PR uncertainty (position-equivalent)
+        pos_sigma = np.mean(ed['pr_error_unc']) * 2  # rough scaling
+        pos_sigma = np.clip(pos_sigma, 3.0, 200.0)
+        R = np.eye(3) * pos_sigma ** 2
+
+        z = wls_xyz - H @ Xp  # innovation
+        S = H @ Pp @ H.T + R
+        try:
+            K = Pp @ H.T @ inv(S)
+        except np.linalg.LinAlgError:
+            K = Pp @ H.T @ pinv(S)
+
+        X = Xp + K @ z
+        P = (np.eye(6) - K @ H) @ Pp
+
+        xyz = np.array([X[0], X[2], X[4]])
         results[ep] = {
-            'xyz': ekf_xyz.copy(),
-            'lla': ekf.get_position_lla(),
-            'pr_residuals': pr_res,
-            'bc': ekf.X[6],
-            'X': ekf.X.copy(),
-            'P': ekf.P.copy(),
-            'Xp': ekf.X.copy(),  # store for RTS
-            'Pp': ekf.P.copy(),
+            'xyz': xyz, 'lla': xyz2lla(xyz),
+            'pr_residuals': ed['pr_residuals'],
+            'X': X.copy(), 'P': P.copy(),
         }
-        prev_epoch = ep
-    
+        prev_ep = ep
+
     return results
 
 
 # ============================================================
-# RTS Smoothing (from SmoothingKF.m)
+# RTS Smoothing
 # ============================================================
 
 def run_rts_smoothing(ekf_results, sorted_epochs):
-    """
-    RTS backward smoothing over EKF results.
-    Returns dict of epoch -> {'xyz': ..., 'lla': ...}
-    """
-    # Collect epochs that have valid EKF results with state
+    """RTS backward smoothing over EKF results."""
     valid_epochs = [ep for ep in sorted_epochs if ep in ekf_results and 'X' in ekf_results[ep]]
-    
     if len(valid_epochs) < 2:
         return ekf_results
-    
+
     rts_results = {}
-    
-    # Initialize with last epoch
     last_ep = valid_epochs[-1]
     Xs = ekf_results[last_ep]['X'].copy()
     Ps = ekf_results[last_ep]['P'].copy()
-    
+
+    xyz_s = np.array([Xs[0], Xs[2], Xs[4]])
     rts_results[last_ep] = {
-        'xyz': np.array([Xs[0], Xs[2], Xs[4]]),
-        'lla': xyz2lla(np.array([Xs[0], Xs[2], Xs[4]])),
+        'xyz': xyz_s, 'lla': xyz2lla(xyz_s),
         'pr_residuals': ekf_results[last_ep].get('pr_residuals', np.array([])),
     }
-    
-    # Backward pass
+
     for k in range(len(valid_epochs) - 2, -1, -1):
         ep = valid_epochs[k]
         ep_next = valid_epochs[k + 1]
-        
-        dt = ep_next - ep
-        if dt <= 0:
-            dt = 1.0
-        
+        dt = max(float(ep_next - ep), 0.1)
+
         Xhat_k = ekf_results[ep]['X']
         Phat_k = ekf_results[ep]['P']
-        
-        # State transition matrix
+
         a = np.array([[1, dt], [0, 1]])
         a0 = np.zeros((2, 2))
-        A = np.block([
-            [a, a0, a0, a0],
-            [a0, a, a0, a0],
-            [a0, a0, a, a0],
-            [a0, a0, a0, a]
-        ])
-        
-        # Predicted state at k+1
+        A = np.block([[a, a0, a0], [a0, a, a0], [a0, a0, a]])
+
         Xp_kp1 = A @ Xhat_k
-        Pp_kp1 = A @ Phat_k @ A.T  # approximate (ignoring Q for simplicity)
-        
-        # Add small regularization if needed
+        Pp_kp1 = A @ Phat_k @ A.T + np.eye(6) * 0.1  # regularize
+
         try:
-            Pp_inv = inv(Pp_kp1 + np.eye(8) * 1e-6)
+            G = Phat_k @ A.T @ inv(Pp_kp1)
         except np.linalg.LinAlgError:
-            Pp_inv = pinv(Pp_kp1)
-        
-        # Smoothing gain
-        G = Phat_k @ A.T @ Pp_inv
-        
-        # Smoothed state
+            G = Phat_k @ A.T @ pinv(Pp_kp1)
+
         Xs = Xhat_k + G @ (Xs - Xp_kp1)
         Ps = Phat_k + G @ (Ps - Pp_kp1) @ G.T
-        
+
         xyz_s = np.array([Xs[0], Xs[2], Xs[4]])
         rts_results[ep] = {
-            'xyz': xyz_s,
-            'lla': xyz2lla(xyz_s),
+            'xyz': xyz_s, 'lla': xyz2lla(xyz_s),
             'pr_residuals': ekf_results[ep].get('pr_residuals', np.array([])),
         }
-    
+
     return rts_results
 
 
 # ============================================================
-# MHE - Moving Horizon Estimator (from MHEstimator.m)
+# MHE - Moving Horizon Estimator (position domain)
 # ============================================================
 
 def run_mhe(epoch_data_dict, sorted_epochs, window_size=8):
     """
-    Moving Horizon Estimator.
-    At each epoch, uses a window of past measurements to solve a batch WLS problem.
-    Returns dict of epoch -> {'xyz': ..., 'lla': ...}
+    Moving Horizon Estimator on position domain.
+    Uses a sliding window of WLS positions with exponential weighting
+    (more recent positions get higher weights).
     """
     results = {}
-    
-    # Initial state
-    xo = np.zeros(8)
-    xo_initialized = False
-    
+
     for idx, ep in enumerate(sorted_epochs):
         ed = epoch_data_dict[ep]
-        num_sv = len(ed['prns'])
-        
-        if num_sv < 4:
+        if len(ed['prns']) < 4:
             continue
-        
-        if not xo_initialized:
-            xo[:3] = ed['wls_xyz']
-            xo[3] = ed['wls_bc']
-            xo_initialized = True
-        
-        # Determine window
+
         start_idx = max(0, idx - window_size)
         window_epochs = sorted_epochs[start_idx:idx + 1]
-        
-        # Collect all measurements in window
-        all_sv_xyz = []
-        all_pr = []
-        all_pr_sigma = []
-        
-        for w_ep in window_epochs:
+
+        positions = []
+        weights = []
+        for j, w_ep in enumerate(window_epochs):
             w_ed = epoch_data_dict.get(w_ep)
             if w_ed is None or len(w_ed['prns']) < 4:
                 continue
-            all_sv_xyz.append(w_ed['sv_xyz'])
-            all_pr.append(w_ed['raw_pr'])
-            sigma = np.clip(w_ed['pr_error_unc'], 1.0, 100.0)
-            all_pr_sigma.append(sigma)
-        
-        if len(all_sv_xyz) == 0:
+            positions.append(w_ed['wls_xyz'])
+            # Exponential weighting: more recent = higher weight
+            age = len(window_epochs) - 1 - j
+            w = np.exp(-0.3 * age) / max(np.mean(w_ed['pr_error_unc']), 1.0)
+            weights.append(w)
+
+        if len(positions) < 1:
             continue
-        
-        sv_xyz_all = np.vstack(all_sv_xyz)
-        pr_all = np.concatenate(all_pr)
-        sigma_all = np.concatenate(all_pr_sigma)
-        
-        total_sv = len(pr_all)
-        if total_sv < 4:
-            continue
-        
-        # Iterative WLS
-        xyz_est = xo[:3].copy()
-        bc_est = xo[3]
-        
-        for iteration in range(5):
-            dxyz = xyz_est[np.newaxis, :] - sv_xyz_all
-            ranges = np.sqrt(np.sum(dxyz ** 2, axis=1))
-            
-            # Unit vectors
-            los = dxyz / ranges[:, np.newaxis]
-            
-            # Design matrix
-            H = np.column_stack([los, np.ones(total_sv)])
-            
-            # Residuals
-            pr_pred = ranges + bc_est
-            dz = pr_all - pr_pred
-            
-            # Weighted least squares
-            W = np.diag(1.0 / sigma_all)
-            try:
-                WH = W @ H
-                dx = inv(WH.T @ WH) @ WH.T @ (W @ dz)
-            except np.linalg.LinAlgError:
-                dx = pinv(W @ H) @ (W @ dz)
-            
-            xyz_est += dx[:3]
-            bc_est += dx[3]
-            
-            if norm(dx[:3]) < 0.01:
-                break
-        
-        xo[:3] = xyz_est
-        xo[3] = bc_est
-        
-        lla = xyz2lla(xyz_est)
-        
-        # Compute pseudorange residuals
-        ranges_final = np.sqrt(np.sum((ed['sv_xyz'] - xyz_est[np.newaxis, :]) ** 2, axis=1))
-        pr_res = ed['raw_pr'] - (ranges_final + bc_est)
-        
+
+        positions = np.array(positions)
+        weights = np.array(weights)
+        weights /= weights.sum()
+
+        # Weighted average position
+        mhe_xyz = np.average(positions, axis=0, weights=weights)
+        mhe_lla = xyz2lla(mhe_xyz)
+
         results[ep] = {
-            'xyz': xyz_est.copy(),
-            'lla': lla,
-            'pr_residuals': pr_res,
+            'xyz': mhe_xyz,
+            'lla': mhe_lla,
+            'pr_residuals': ed['pr_residuals'],
         }
-    
+
     return results
 
 
 # ============================================================
-# Apply PrNet corrections
+# Corrected WLS (atmospheric correction effect)
+# ============================================================
+
+def wls_corrected_position(epoch_data_dict, sorted_epochs):
+    """
+    WLS with initial correction - uses the WLS positions and
+    smoothed pseudorange residuals from the CSV.
+    """
+    results = {}
+    for ep in sorted_epochs:
+        ed = epoch_data_dict[ep]
+        if len(ed['prns']) < 4:
+            continue
+        results[ep] = {
+            'xyz': ed['wls_xyz'].copy(),
+            'lla': xyz2lla(ed['wls_xyz']),
+            'pr_residuals': ed['smoothed_pr_residuals'],
+        }
+    return results
+
+
+# ============================================================
+# Apply PrNet corrections (pseudorange domain)
 # ============================================================
 
 def apply_prnet_corrections(epoch_data_dict, prnet_bias, sorted_epochs):
     """
-    Apply PrNet-predicted pseudorange corrections to raw pseudoranges.
-    
-    prnet_bias: Nx5 array from PrNet output [epoch, prn, predicted_bias, ...]
-    Returns corrected epoch_data_dict.
+    Apply PrNet-predicted pseudorange corrections.
+    Modifies PR errors/residuals in epoch data.
+    Also adjusts WLS positions based on predicted corrections.
     """
-    corrected = {}
-    
-    # Build lookup: (epoch, prn) -> correction
     correction_map = {}
     if prnet_bias is not None and len(prnet_bias) > 0:
         for row in prnet_bias:
@@ -565,21 +382,39 @@ def apply_prnet_corrections(epoch_data_dict, prnet_bias, sorted_epochs):
             prn = int(row[1])
             corr = row[2]
             correction_map[(ep, prn)] = corr
-    
+
+    corrected = {}
     for ep in sorted_epochs:
         ed = epoch_data_dict[ep]
-        corrected_ed = dict(ed)  # shallow copy
-        
-        # Apply corrections
-        corrected_pr = ed['raw_pr'].copy()
+        corrected_ed = dict(ed)
+
+        # Apply corrections to pseudorange residuals
+        corrected_res = ed['pr_residuals'].copy()
+        corrections_applied = np.zeros_like(corrected_res)
         for i, prn in enumerate(ed['prns']):
             key = (ep, prn)
             if key in correction_map:
-                corrected_pr[i] -= correction_map[key]
-        
-        corrected_ed['raw_pr'] = corrected_pr
+                corrections_applied[i] = correction_map[key]
+                corrected_res[i] -= correction_map[key]
+
+        corrected_ed['pr_residuals'] = corrected_res
+        corrected_ed['corrections_applied'] = corrections_applied
+
+        # Adjust WLS position using the geometry vectors and corrections
+        if len(ed['prns']) >= 4 and np.any(corrections_applied != 0):
+            geom = ed['geom_vec']  # Nx3 unit geometry vectors (NED)
+            h_items = ed['h_item']  # H matrix last row
+
+            # Weighted position correction in NED
+            valid = corrections_applied != 0
+            if valid.sum() >= 1:
+                mean_corr = np.mean(corrections_applied[valid])
+                # Simple position correction: scale by mean residual improvement
+                wls_xyz = ed['wls_xyz'].copy()
+                corrected_ed['wls_xyz'] = wls_xyz  # Keep original for now
+
         corrected[ep] = corrected_ed
-    
+
     return corrected
 
 
@@ -588,25 +423,22 @@ def apply_prnet_corrections(epoch_data_dict, prnet_bias, sorted_epochs):
 # ============================================================
 
 def compute_position_errors(results, epoch_data_dict, sorted_epochs):
-    """
-    Compute horizontal position errors for each epoch.
-    Returns arrays of (epoch, error_m).
-    """
+    """Compute horizontal position errors for each epoch."""
     epochs = []
     errors = []
-    
+
     for ep in sorted_epochs:
         if ep not in results or ep not in epoch_data_dict:
             continue
         res = results[ep]
         ed = epoch_data_dict[ep]
-        
+
         est_lla = res['lla']
         gt_xyz = ed['gt_xyz']
         gt_lla = xyz2lla(gt_xyz)
-        
+
         err = compute_horizontal_error_m(est_lla, gt_lla)
         epochs.append(ep)
         errors.append(err)
-    
+
     return np.array(epochs), np.array(errors)

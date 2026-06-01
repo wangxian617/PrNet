@@ -41,7 +41,7 @@ class PBCRF:
         all_labels = []
 
         for batch in data_iter:
-            x, y = [z.to(device) for z in batch]
+            x = batch[0].to(device)
             post_x, valid_idx = data_preprocessing(x, device)
 
             for i in range(x.shape[0]):
@@ -82,7 +82,7 @@ class PBCRF:
         inference_times = []
 
         for batch in data_iter:
-            x, y = [z.to(device) for z in batch]
+            x = batch[0].to(device)
             post_x, valid_idx = data_preprocessing(x, device)
 
             for i in range(x.shape[0]):
@@ -100,11 +100,10 @@ class PBCRF:
                 preds = self.model.predict(feats)
                 inference_times.append(time.time() - start)
 
-                # Build output: [epoch, prn, prediction, smoothed_residual, unsmoothed_residual]
                 enc_x = x[i]
                 epochs = enc_x[mask, 0].cpu().numpy()
                 prns = enc_x[mask, 1].cpu().numpy()
-                smoothed_res = enc_x[mask, 34].cpu().numpy()  # smoothed PR residuals
+                smoothed_res = enc_x[mask, 34].cpu().numpy()
                 unsmoothed_res = enc_x[mask, 31].cpu().numpy()
 
                 out = np.column_stack([epochs, prns, preds, smoothed_res, unsmoothed_res])
@@ -241,7 +240,7 @@ class FCNNLSTMWrapper:
 
         with torch.no_grad():
             for batch in data_iter:
-                x, y = [z.to(self.device) for z in batch]
+                x = batch[0].to(self.device)
                 post_x, valid_idx = data_preprocessing(x, self.device)
 
                 features = torch.cat([
@@ -269,16 +268,12 @@ class FCNNLSTMWrapper:
 
         if output_seq:
             return np.vstack(output_seq), inference_times
-        return np.array([]).reshape(0, 7), inference_times
+        return np.array([]).reshape(0, 6), inference_times
 
     @property
     def num_parameters(self):
         return sum(p.numel() for p in self.model.parameters() if p.requires_grad)
 
-
-# ============================================================
-# Set Transformer
-# ============================================================
 
 class MAB(nn.Module):
     """Multihead Attention Block."""
@@ -445,7 +440,7 @@ class SetTransformerWrapper:
 
         with torch.no_grad():
             for batch in data_iter:
-                x, y = [z.to(self.device) for z in batch]
+                x = batch[0].to(self.device)
                 post_x, valid_idx = data_preprocessing(x, self.device)
 
                 features = torch.cat([

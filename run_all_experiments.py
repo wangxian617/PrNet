@@ -784,7 +784,7 @@ def main():
 
     # ---- Ablation experiments ----
     # Use reduced epochs for faster execution
-    ablation_epochs = 50
+    ablation_epochs = 10
     ablation_results_all = {}
 
     # RouteR ablation (use first test file)
@@ -814,7 +814,7 @@ def main():
                 ablation_results_all['U'] = abl_u
 
     # ---- Comparison models ----
-    comp_epochs = 50
+    comp_epochs = 10
     model_stats_all = {}
 
     if os.path.isdir(route_r_train_dir) and os.listdir(route_r_train_dir):

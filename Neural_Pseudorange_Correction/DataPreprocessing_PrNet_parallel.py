@@ -1,7 +1,10 @@
 import torch
 import statistics
 from torch import nn
-from d2l import torch as d2l
+try:
+    from d2l import torch as d2l
+except ImportError:
+    d2l = None
 torch.set_default_tensor_type(torch.DoubleTensor)
 
 
